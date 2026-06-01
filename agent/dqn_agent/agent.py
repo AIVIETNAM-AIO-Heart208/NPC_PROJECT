@@ -429,7 +429,7 @@ class TrainingAgent:
         self.target_net = DQNModel(self.map_shape, self.aux_dim, num_actions).to(device)
         self.target_net.load_state_dict(self.q_net.state_dict()) # Sync weights initially
         
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.SmoothL1Loss()
 
     def act(self, map_state, aux_state, epsilon=0.0, valid_actions=None):
         """
@@ -496,21 +496,20 @@ class TrainingAgent:
         # gather() extracts the Q-value for the specific action taken
         q_values = self.q_net(map_state_t, aux_state_t).gather(1, action_t)
 
-        # max(1)[0] gets the max Q-value for the next state
-            # ~ max_a' {Q(s', a', weights)}
-        # If done=1, the future reward is 0.
-            # Q*(s, a) = E[r + gamma * max_a' {Q*(s', a')}]
-            # ~ Q(s, a) = r + gamma * max_a' {Q(s', a', weights)} if not done else Q(s, a) = r
-        # inference_mode is stricter than no_grad: disables autograd engine entirely
         with torch.no_grad():
-            next_q = self.target_net(next_map_state_t, next_aux_state_t)
-            next_q = next_q.masked_fill(next_action_mask_t <= 0.0, -1e9)
-            max_next_q = next_q.max(1)[0].unsqueeze(1)
+            # Double DQN: online net chooses the next action, target net prices it.
+            next_online_q = self.q_net(next_map_state_t, next_aux_state_t)
+            next_online_q = next_online_q.masked_fill(next_action_mask_t <= 0.0, -1e9)
+            next_action_t = next_online_q.argmax(1, keepdim=True)
+
+            next_target_q = self.target_net(next_map_state_t, next_aux_state_t)
+            max_next_q = next_target_q.gather(1, next_action_t)
             target_q   = reward_t + self.gamma * max_next_q * (1 - done_t)
 
         loss = self.loss_fn(q_values, target_q)
         self.optimizer.zero_grad(set_to_none=True)  # skip memset, just nullify refs
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=10.0)
         self.optimizer.step()
         self.global_step += 1
         return loss.item()
@@ -544,6 +543,10 @@ def train_dqn(
     epsilon_start=None,
     epsilon_min=0.03,
     epsilon_decay=0.997,
+    batch_size=128,
+    buffer_capacity=100_000,
+    target_update_steps=1_000,
+    save_every_episodes=100,
 ):
     # Training-only imports - placed here so they don't run when the evaluator loads this file
     import sys as _sys
@@ -582,7 +585,7 @@ def train_dqn(
     enemy_agents = make_enemy_agents()
 
     # hyperparam
-    batch_size         = 64
+    batch_size         = int(batch_size)
     lr                 = 1e-3
 
     dummy_obs = env.reset(seed=seed)
@@ -598,12 +601,14 @@ def train_dqn(
         epsilon = float(epsilon_start)
     input_spec = (user_agent.map_shape, user_agent.aux_dim)
     encode_channels = int(user_agent.map_shape[0])
-    buffer = ReplayBuffer(capacity=10_000, map_shape=input_spec[0], aux_dim=input_spec[1])
+    buffer = ReplayBuffer(capacity=int(buffer_capacity), map_shape=input_spec[0], aux_dim=input_spec[1])
 
     global_step = 0
     loss_history = []
     reward_history = []
     win_history = []
+    model_folder = f"ckpts/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed"
+    Path(model_folder).mkdir(parents=True, exist_ok=True)
     with tqdm(total=num_episodes, desc="Training DQN") as pbar:
         for ep in range(num_episodes):
             if enemy_type == "mixed":
@@ -675,6 +680,8 @@ def train_dqn(
                         sampled_next_action_mask,
                     )
                     loss_history.append(loss)
+                    if int(target_update_steps) > 0 and user_agent.global_step % int(target_update_steps) == 0:
+                        user_agent.update_target_network()
 
                 # 6. Update
                 obs       = next_obs
@@ -687,13 +694,24 @@ def train_dqn(
 
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
             user_agent.epsilon = epsilon
-            if ep % 10 == 0:
-                user_agent.update_target_network()
+            if (
+                save_model
+                and save_every_episodes
+                and (ep + 1) % int(save_every_episodes) == 0
+            ):
+                save_model_fn(
+                    user_agent.q_net,
+                    user_agent.optimizer,
+                    user_agent.global_step,
+                    user_agent.epsilon,
+                    user_agent.lr,
+                    input_spec,
+                    num_actions,
+                    f"{model_folder}/{user_agent.global_step}_global_step_ep{ep + 1}.pth",
+                )
             pbar.update(1)
             pbar.set_postfix(reward=f"{total_reward:.2f}", epsilon=f"{epsilon:.3f}")
 
-    model_folder = f"ckpts/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed"
-    Path(model_folder).mkdir(parents=True, exist_ok=True)
     if save_model:
         model_path = f"{model_folder}/{user_agent.global_step}_global_step.pth"
         submission_model_path = Path(__file__).resolve().parent / "model.pth"
@@ -733,6 +751,10 @@ def training():
     parser.add_argument("--epsilon_start", type=float, default=None, help="Initial epsilon for exploration. Defaults to checkpoint epsilon when --load_model is used.")
     parser.add_argument("--epsilon_min", type=float, default=0.03, help="Minimum epsilon")
     parser.add_argument("--epsilon_decay", type=float, default=0.997, help="Episode-level epsilon decay")
+    parser.add_argument("--batch_size", type=int, default=128, help="Replay batch size")
+    parser.add_argument("--buffer_capacity", type=int, default=100000, help="Replay buffer capacity")
+    parser.add_argument("--target_update_steps", type=int, default=1000, help="Train steps between target-network syncs")
+    parser.add_argument("--save_every_episodes", type=int, default=100, help="Save intermediate checkpoints every N episodes; 0 disables")
     args = parser.parse_args()
     
     seed_everything(args.seed)
@@ -746,7 +768,11 @@ def training():
                     pretrained_model=args.load_model,
                     epsilon_start=args.epsilon_start,
                     epsilon_min=args.epsilon_min,
-                    epsilon_decay=args.epsilon_decay)
+                    epsilon_decay=args.epsilon_decay,
+                    batch_size=args.batch_size,
+                    buffer_capacity=args.buffer_capacity,
+                    target_update_steps=args.target_update_steps,
+                    save_every_episodes=args.save_every_episodes)
     
 # Mandatory for submission
 class Agent:

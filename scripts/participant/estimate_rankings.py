@@ -7,10 +7,10 @@ from pathlib import Path
 import trueskill
 import numpy as np
 
-parent_dir = Path(__file__).resolve().parent.parent
-# Add parent directory to sys.path if not already present
-if str(parent_dir) not in sys.path:
-    sys.path.insert(0, str(parent_dir))
+root_dir = Path(__file__).resolve().parent.parent.parent
+# Add project root directory to sys.path if not already present
+if str(root_dir) not in sys.path:
+    sys.path.insert(0, str(root_dir))
 
 from engine.game import BomberEnv
 from scripts.participant.run_local_match import make_agents

@@ -25,17 +25,19 @@ def _parse_bomb_row(b):
 
 
 REWARD_DICT = {
-    "win": 2.0,
-    "enemy_death": 1.0,
-    "agent_death": -2.0,
-    "standing_still": -0.01,
-    "time_penalty": -0.005,
-    "plant_near_box": 0.05,
-    "item_collection": 0.1,
-    "danger_evasion": 0.12,
-    "danger_enter": -0.06,
-    "own_blast_loiter": -0.04,
-    "approach_enemy": 0.02,
+    "win": 12.0,
+    "enemy_death": 5.0,
+    "agent_death": -8.0,
+    "standing_still": -0.015,
+    "time_penalty": -0.002,
+    "bomb_placed": 0.03,
+    "plant_near_box": 0.25,
+    "box_destroyed": 0.80,
+    "item_collection": 0.45,
+    "danger_evasion": 0.08,
+    "danger_enter": -0.12,
+    "own_blast_loiter": -0.08,
+    "approach_enemy": 0.005,
 }
 
 
@@ -79,11 +81,13 @@ def _blast_status_at(obs, x, y):
     grid = obs["map"]
     in_blast = False
     min_timer = None
+    effective_timers = _effective_bomb_timers(obs)
     for i in range(arr.shape[0]):
         parsed = _parse_bomb_row(arr[i])
         if parsed is None:
             continue
         bx, by, timer, owner_id = parsed
+        timer = effective_timers.get(i, timer)
         radius = _bomb_radius_from_obs(players, owner_id)
         tiles = _explosion_tiles_for_bomb(grid, bx, by, radius)
         if (ix, iy) in tiles:
@@ -98,6 +102,92 @@ def _any_bombs(obs):
     if b is None:
         return False
     return np.asarray(b).size > 0
+
+
+def _own_bomb_count(obs, agent_id):
+    bombs = obs["bombs"]
+    if bombs is None:
+        return 0
+    arr = np.asarray(bombs)
+    if arr.size == 0:
+        return 0
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    count = 0
+    for i in range(arr.shape[0]):
+        parsed = _parse_bomb_row(arr[i])
+        if parsed is None:
+            continue
+        _, _, _, owner_id = parsed
+        if int(owner_id) == int(agent_id):
+            count += 1
+    return count
+
+
+def _blast_owners_at(obs, x, y):
+    bombs = obs["bombs"]
+    if bombs is None:
+        return []
+    arr = np.asarray(bombs)
+    if arr.size == 0:
+        return []
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+
+    owners = []
+    players = obs["players"]
+    grid = obs["map"]
+    ix, iy = int(x), int(y)
+    for i in range(arr.shape[0]):
+        parsed = _parse_bomb_row(arr[i])
+        if parsed is None:
+            continue
+        bx, by, _timer, owner_id = parsed
+        radius = _bomb_radius_from_obs(players, owner_id)
+        if (ix, iy) in _explosion_tiles_for_bomb(grid, bx, by, radius):
+            owners.append(int(owner_id))
+    return owners
+
+
+def _effective_bomb_timers(obs):
+    bombs = obs["bombs"]
+    if bombs is None:
+        return {}
+    arr = np.asarray(bombs)
+    if arr.size == 0:
+        return {}
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+
+    timers = {}
+    blasts = {}
+    players = obs["players"]
+    grid = obs["map"]
+    for i in range(arr.shape[0]):
+        parsed = _parse_bomb_row(arr[i])
+        if parsed is None:
+            continue
+        bx, by, timer, owner_id = parsed
+        timers[i] = int(timer)
+        radius = _bomb_radius_from_obs(players, owner_id)
+        blasts[i] = _explosion_tiles_for_bomb(grid, bx, by, radius)
+
+    changed = True
+    while changed:
+        changed = False
+        for trigger_idx, trigger_tiles in blasts.items():
+            trigger_timer = timers[trigger_idx]
+            for target_idx in range(arr.shape[0]):
+                if target_idx == trigger_idx or target_idx not in timers:
+                    continue
+                parsed = _parse_bomb_row(arr[target_idx])
+                if parsed is None:
+                    continue
+                bx, by, _timer, _owner_id = parsed
+                if (bx, by) in trigger_tiles and timers[target_idx] > trigger_timer:
+                    timers[target_idx] = trigger_timer
+                    changed = True
+    return timers
 
 
 def _enemy_alive_count(players, agent_id):
@@ -115,6 +205,15 @@ def _enemy_alive_count(players, agent_id):
         1 for pid in range(n)
         if pid != agent_id and int(arr[pid][2]) == 1
     )
+
+
+def _player_rows(players):
+    if isinstance(players, dict):
+        return list(players.values())
+    arr = np.asarray(players)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    return list(arr)
 
 
 def _manhattan_to_nearest_alive_enemy(players, agent_id, x, y):
@@ -158,6 +257,7 @@ def _min_own_blast_timer_at(obs, agent_id, x, y):
     ix, iy = int(x), int(y)
     aid = int(agent_id)
     best = None
+    effective_timers = _effective_bomb_timers(obs)
     for i in range(arr.shape[0]):
         parsed = _parse_bomb_row(arr[i])
         if parsed is None:
@@ -165,6 +265,7 @@ def _min_own_blast_timer_at(obs, agent_id, x, y):
         bx, by, timer, owner_id = parsed
         if int(owner_id) != aid:
             continue
+        timer = effective_timers.get(i, timer)
         radius = _bomb_radius_from_obs(players, owner_id)
         tiles = _explosion_tiles_for_bomb(grid, bx, by, radius)
         if (ix, iy) in tiles:
@@ -192,9 +293,17 @@ def compute_reward(prev_obs, curr_obs, agent_id):
     prev_enemies_alive = _enemy_alive_count(prev_players, agent_id)
     curr_enemies_alive = _enemy_alive_count(curr_players, agent_id)
     
-    if curr_enemies_alive < prev_enemies_alive:
-        reward += REWARD_DICT["enemy_death"] * (prev_enemies_alive - curr_enemies_alive)
-    if curr_enemies_alive == 0 and prev_enemies_alive > 0:
+    killed_by_me = 0
+    for pid in range(len(curr_players)):
+        if pid == agent_id:
+            continue
+        if int(prev_players[pid][2]) == 1 and int(curr_players[pid][2]) == 0:
+            px, py = int(prev_players[pid][0]), int(prev_players[pid][1])
+            if int(agent_id) in _blast_owners_at(prev_obs, px, py):
+                killed_by_me += 1
+    if killed_by_me > 0:
+        reward += REWARD_DICT["enemy_death"] * killed_by_me
+    if curr_alive == 1 and curr_enemies_alive == 0 and prev_enemies_alive > 0:
         reward += REWARD_DICT["win"]
 
     # 2. MOVEMENT & TIME PENALTIES
@@ -242,7 +351,15 @@ def compute_reward(prev_obs, curr_obs, agent_id):
     # 3. ITEM COLLECTION
     # Based on your legend: 3 is item_radius, 4 is item_capacity
     stepped_on_tile = prev_obs["map"][curr_x, curr_y]
-    if stepped_on_tile in [3, 4]: 
+    if (
+        stepped_on_tile in [3, 4]
+        and int(curr_alive) == 1
+        and sum(
+            1
+            for p in _player_rows(curr_players)
+            if int(p[2]) == 1 and int(p[0]) == int(curr_x) and int(p[1]) == int(curr_y)
+        ) == 1
+    ):
         reward += REWARD_DICT["item_collection"]
     else:
         # Fallback check just in case items spawn under players or map updates differently
@@ -251,11 +368,27 @@ def compute_reward(prev_obs, curr_obs, agent_id):
         if curr_radius_bonus > prev_radius_bonus:
              reward += REWARD_DICT["item_collection"]
 
+    # 3b. ACTUAL BOX DESTRUCTION
+    # The old reward only noticed "placed bomb near box", which is useful early
+    # but too weak for learning whether the bomb eventually paid off.
+    prev_map = np.asarray(prev_obs["map"])
+    curr_map = np.asarray(curr_obs["map"])
+    if prev_map.shape == curr_map.shape:
+        destroyed_boxes = int(np.logical_and(prev_map == Map.BOX, curr_map != Map.BOX).sum())
+        if destroyed_boxes > 0:
+            owned_boxes = 0
+            for x, y in np.argwhere(np.logical_and(prev_map == Map.BOX, curr_map != Map.BOX)):
+                if int(agent_id) in _blast_owners_at(prev_obs, int(x), int(y)):
+                    owned_boxes += 1
+            reward += REWARD_DICT["box_destroyed"] * owned_boxes
+
     # 4. REWARD SHAPING: Box Destruction Proxy
     prev_bombs_left = int(prev_players[agent_id][3])
     curr_bombs_left = int(curr_players[agent_id][3])
     
     if curr_bombs_left < prev_bombs_left:
+        reward += REWARD_DICT["bomb_placed"]
+
         # Check immediate adjacent tiles (up, down, left, right)
         adjacent_tiles = [
             prev_obs["map"][max(0, curr_x-1), curr_y],
@@ -317,7 +450,7 @@ class UnitTestReward:
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Agent Moving Reward: {reward}")
         # Moving avoids the standing still penalty, but still incurs the time penalty
-        expected = -REWARD_DICT["time_penalty"] 
+        expected = -REWARD_DICT["standing_still"] + REWARD_DICT["time_penalty"]
         assert reward == expected, f"Expected {expected} for just moving"
     
     def agent_plant_near_box(self):
@@ -338,6 +471,7 @@ class UnitTestReward:
         expected = (
             REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["bomb_placed"]
             + REWARD_DICT["plant_near_box"]
             + REWARD_DICT["own_blast_loiter"]
         )
@@ -376,6 +510,7 @@ class UnitTestReward:
         expected = (
             REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["bomb_placed"]
             + REWARD_DICT["own_blast_loiter"]
         )
         assert reward == expected, "Expected standing/time + own-blast loiter for bomb on self"

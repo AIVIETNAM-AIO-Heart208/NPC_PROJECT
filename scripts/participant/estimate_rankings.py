@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import trueskill
+import numpy as np
 
 parent_dir = Path(__file__).resolve().parent.parent
 # Add parent directory to sys.path if not already present
@@ -13,6 +14,88 @@ if str(parent_dir) not in sys.path:
 
 from engine.game import BomberEnv
 from scripts.participant.run_local_match import make_agents
+
+
+def _empty_stats(n_players=4):
+    return [{"kills": 0, "boxes": 0, "items": 0, "bombs": 0} for _ in range(n_players)]
+
+
+def _blast_tiles(grid, bx, by, radius):
+    tiles = {(bx, by)}
+    h, w = grid.shape
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for r in range(1, radius + 1):
+            x, y = bx + dx * r, by + dy * r
+            if not (0 <= x < h and 0 <= y < w):
+                break
+            cell = int(grid[x, y])
+            if cell == 1:
+                break
+            tiles.add((x, y))
+            if cell == 2:
+                break
+    return tiles
+
+
+def _owner_of_blast_tile(obs, x, y):
+    for b in obs["bombs"]:
+        bx, by, _timer, owner_id = [int(v) for v in b]
+        radius = 1 + int(obs["players"][owner_id][4])
+        if (x, y) in _blast_tiles(obs["map"], bx, by, radius):
+            return owner_id
+    return None
+
+
+def _update_stats(stats, prev_obs, next_obs, actions):
+    prev_players = prev_obs["players"]
+    next_players = next_obs["players"]
+    prev_grid = prev_obs["map"]
+    next_grid = next_obs["map"]
+    prev_bomb_positions = {(int(b[0]), int(b[1])) for b in prev_obs["bombs"]}
+
+    for pid, action in enumerate(actions):
+        if int(prev_players[pid][2]) != 1:
+            continue
+        px, py = int(prev_players[pid][0]), int(prev_players[pid][1])
+        if int(action) == 5 and int(prev_players[pid][3]) > 0 and (px, py) not in prev_bomb_positions:
+            stats[pid]["bombs"] += 1
+
+        nx, ny = int(next_players[pid][0]), int(next_players[pid][1])
+        occupants = sum(
+            1
+            for p in next_players
+            if int(p[2]) == 1 and int(p[0]) == nx and int(p[1]) == ny
+        )
+        if int(next_players[pid][2]) == 1 and int(prev_grid[nx, ny]) in (3, 4) and occupants == 1:
+            stats[pid]["items"] += 1
+
+    for x, y in np.argwhere((prev_grid == 2) & (next_grid != 2)):
+        owner = _owner_of_blast_tile(prev_obs, int(x), int(y))
+        if owner is not None:
+            stats[owner]["boxes"] += 1
+
+    for victim_id, prev_player in enumerate(prev_players):
+        if int(prev_player[2]) != 1 or int(next_players[victim_id][2]) == 1:
+            continue
+        owner = _owner_of_blast_tile(prev_obs, int(prev_player[0]), int(prev_player[1]))
+        if owner is not None and owner != victim_id:
+            stats[owner]["kills"] += 1
+
+
+def _rank_key(stats, players, pid):
+    alive = 1 if int(players[pid][2]) == 1 else 0
+    return (
+        alive,
+        int(stats[pid]["kills"]),
+        int(stats[pid]["boxes"]),
+        int(stats[pid]["items"]),
+        int(stats[pid]["bombs"]),
+    )
+
+
+def _ranks_from_tiebreak(stats, players):
+    keys = [_rank_key(stats, players, pid) for pid in range(len(stats))]
+    return [sum(1 for other in keys if other > key) for key in keys]
 
 
 def estimate_rankings(agent_path, num_matches=100, max_steps=500):
@@ -46,6 +129,7 @@ def estimate_rankings(agent_path, num_matches=100, max_steps=500):
         
         prev_alive = [bool(p[2]) for p in obs["players"]]
         death_order = []
+        stats = _empty_stats(4)
         
         while not done and step < max_steps:
             actions = []
@@ -56,7 +140,9 @@ def estimate_rankings(agent_path, num_matches=100, max_steps=500):
                     action = 0
                 actions.append(action)
                 
+            prev_obs = obs
             obs, terminated, truncated = env.step(actions)
+            _update_stats(stats, prev_obs, obs, actions)
             done = terminated or truncated
             step += 1
             
@@ -66,27 +152,11 @@ def estimate_rankings(agent_path, num_matches=100, max_steps=500):
                     death_order.append(j)
             prev_alive = alive_now
             
-        alive_final = [bool(p[2]) for p in obs["players"]]
-        survivors = [j for j in range(4) if alive_final[j]]
-        
-        # Calculate ranks
-        # Rank 0 is best. Death order: first to die gets worst rank.
-        # survivors get rank 0.
-        ranks = [0] * 4
-        # Suppose death_order = [2, 1, 3] -> 2 died first, 1 died second, 3 died third. 0 survived.
-        # 0 gets rank 0. 3 gets rank 1. 1 gets rank 2. 2 gets rank 3.
-        for j in survivors:
-            ranks[j] = 0
-            
-        current_rank = 1 if len(survivors) > 0 else 0
-        for group in reversed(death_order):
-            # death order is list of player indices who died one by one
-            ranks[group] = current_rank
-            current_rank += 1
-            
-        if len(survivors) == 1 and survivors[0] == 0:
+        ranks = _ranks_from_tiebreak(stats, obs["players"])
+
+        if ranks[0] == 0 and all(r > 0 for r in ranks[1:]):
             wins += 1
-        elif len(survivors) > 1 and 0 in survivors:
+        elif ranks[0] == 0:
             draws += 1
             
         total_rank += ranks[0]

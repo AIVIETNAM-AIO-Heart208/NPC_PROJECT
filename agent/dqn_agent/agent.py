@@ -541,7 +541,7 @@ def train_dqn(
     seed=86,
     save_model=True,
     pretrained_model=None,
-    epsilon_start=0.40,
+    epsilon_start=None,
     epsilon_min=0.03,
     epsilon_decay=0.997,
 ):
@@ -582,7 +582,6 @@ def train_dqn(
     enemy_agents = make_enemy_agents()
 
     # hyperparam
-    epsilon            = epsilon_start
     batch_size         = 64
     lr                 = 1e-3
 
@@ -593,6 +592,10 @@ def train_dqn(
     num_actions = 6
 
     user_agent = TrainingAgent(user_id, input_spec, num_actions, lr=lr, device="cuda" if torch.cuda.is_available() else "cpu", pretrained_model=pretrained_model)
+    if epsilon_start is None:
+        epsilon = float(user_agent.epsilon) if pretrained_model else 0.40
+    else:
+        epsilon = float(epsilon_start)
     input_spec = (user_agent.map_shape, user_agent.aux_dim)
     encode_channels = int(user_agent.map_shape[0])
     buffer = ReplayBuffer(capacity=10_000, map_shape=input_spec[0], aux_dim=input_spec[1])
@@ -727,7 +730,7 @@ def training():
     parser.add_argument("--save_model", action="store_true", help="Save model")
     parser.add_argument("--load_model", type=str, default=None, help="Load model")
     parser.add_argument("--skip_training", action="store_true", help="Skip training")
-    parser.add_argument("--epsilon_start", type=float, default=0.40, help="Initial epsilon for exploration")
+    parser.add_argument("--epsilon_start", type=float, default=None, help="Initial epsilon for exploration. Defaults to checkpoint epsilon when --load_model is used.")
     parser.add_argument("--epsilon_min", type=float, default=0.03, help="Minimum epsilon")
     parser.add_argument("--epsilon_decay", type=float, default=0.997, help="Episode-level epsilon decay")
     args = parser.parse_args()

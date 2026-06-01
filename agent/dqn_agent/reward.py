@@ -30,8 +30,9 @@ REWARD_DICT = {
     "agent_death": -8.0,
     "standing_still": -0.015,
     "time_penalty": -0.002,
-    "bomb_placed": 0.03,
-    "plant_near_box": 0.25,
+    "bomb_placed": 0.06,
+    "plant_near_box": 0.65,
+    "box_target": 0.35,
     "box_destroyed": 0.80,
     "item_collection": 0.45,
     "danger_evasion": 0.08,
@@ -61,6 +62,14 @@ def _explosion_tiles_for_bomb(grid, bx, by, radius):
             if cell == Map.BOX:
                 break
     return tiles
+
+
+def _count_boxes_in_blast(grid, bx, by, radius):
+    return sum(
+        1
+        for tx, ty in _explosion_tiles_for_bomb(grid, bx, by, radius)
+        if int(grid[tx, ty]) == Map.BOX
+    )
 
 
 def _blast_status_at(obs, x, y):
@@ -332,10 +341,12 @@ def compute_reward(prev_obs, curr_obs, agent_id):
             # Only when stepping into blast; standing still (e.g. planting on own tile) is excluded
             reward += REWARD_DICT["danger_enter"]
 
-    # Standing in your own blast: penalize more as the fuse runs down (clearer than flat -0.04).
+    # Standing in your own blast is only urgent when the fuse is short. Right
+    # after placing a bomb, timer is still high, so do not teach the agent that
+    # all bomb placements are immediately bad.
     mt_own = _min_own_blast_timer_at(curr_obs, agent_id, curr_x, curr_y)
-    if curr_alive == 1 and mt_own is not None:
-        urgency = max(1, 8 - int(mt_own))
+    if curr_alive == 1 and mt_own is not None and int(mt_own) <= 3:
+        urgency = max(1, 4 - int(mt_own))
         reward += REWARD_DICT["own_blast_loiter"] * float(urgency)
 
     if (
@@ -389,17 +400,12 @@ def compute_reward(prev_obs, curr_obs, agent_id):
     if curr_bombs_left < prev_bombs_left:
         reward += REWARD_DICT["bomb_placed"]
 
-        # Check immediate adjacent tiles (up, down, left, right)
-        adjacent_tiles = [
-            prev_obs["map"][max(0, curr_x-1), curr_y],
-            prev_obs["map"][min(prev_obs["map"].shape[0]-1, curr_x+1), curr_y],
-            prev_obs["map"][curr_x, max(0, curr_y-1)],
-            prev_obs["map"][curr_x, min(prev_obs["map"].shape[1]-1, curr_y+1)]
-        ]
-        
-        # 2 is the integer for "box" based on your legend
-        if 2 in adjacent_tiles:
+        placed_x, placed_y = int(prev_x), int(prev_y)
+        bomb_radius = _bomb_radius_from_obs(prev_players, agent_id)
+        targeted_boxes = _count_boxes_in_blast(prev_obs["map"], placed_x, placed_y, bomb_radius)
+        if targeted_boxes > 0:
             reward += REWARD_DICT["plant_near_box"]
+            reward += REWARD_DICT["box_target"] * min(3, targeted_boxes)
 
     return float(reward)
 
@@ -473,7 +479,7 @@ class UnitTestReward:
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["bomb_placed"]
             + REWARD_DICT["plant_near_box"]
-            + REWARD_DICT["own_blast_loiter"]
+            + REWARD_DICT["box_target"]
         )
         assert reward == expected, "Expected reward for planting near a box"
     
@@ -511,7 +517,6 @@ class UnitTestReward:
             REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["bomb_placed"]
-            + REWARD_DICT["own_blast_loiter"]
         )
         assert reward == expected, "Expected standing/time + own-blast loiter for bomb on self"
 

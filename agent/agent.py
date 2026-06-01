@@ -74,7 +74,7 @@ class Agent:
             can_hit_enemy = self._can_bomb_hit_enemy(grid, my_pos, enemies, bomb_radius)
             boxes_hit = self._count_boxes_in_blast(grid, my_pos, bomb_radius)
             if (can_hit_enemy or boxes_hit >= 1) and self._can_escape_after_placing(
-                grid, my_pos, blocked, bombs, players, bomb_radius
+                grid, my_pos, blocked, danger_soon, bomb_radius
             ):
                 return 5
 
@@ -125,7 +125,10 @@ class Agent:
                     break
         return tiles
 
-    def _bomb_infos(self, grid, bombs, players, default_radius=2, extra_bomb=None):
+    def _danger_tiles(self, grid, bombs, players, default_radius=2):
+        danger_soon = set()
+        danger_now = set()
+
         bomb_infos = []
         for b in bombs:
             bx, by, timer = int(b[0]), int(b[1]), int(b[2])
@@ -143,18 +146,9 @@ class Agent:
                 "blast": self._blast_tiles(grid, bx, by, radius),
             })
 
-        if extra_bomb is not None:
-            bx, by = extra_bomb["pos"]
-            radius = int(extra_bomb["radius"])
-            bomb_infos.append({
-                "pos": (bx, by),
-                "timer": int(extra_bomb["timer"]),
-                "blast": self._blast_tiles(grid, bx, by, radius),
-            })
+        if not bomb_infos:
+            return danger_soon, danger_now
 
-        return bomb_infos
-
-    def _chain_times(self, bomb_infos):
         times = [info["timer"] for info in bomb_infos]
 
         changed = True
@@ -170,48 +164,12 @@ class Agent:
                         times[j] = times[i]
                         changed = True
 
-        return times
-
-    def _danger_tiles(self, grid, bombs, players, default_radius=2):
-        danger_soon = set()
-        danger_now = set()
-
-        bomb_infos = self._bomb_infos(grid, bombs, players, default_radius=default_radius)
-        if not bomb_infos:
-            return danger_soon, danger_now
-
-        times = self._chain_times(bomb_infos)
-
         for info, timer in zip(bomb_infos, times):
             danger_soon |= info["blast"]
             if timer <= 1:
                 danger_now |= info["blast"]
 
         return danger_soon, danger_now
-
-    def _timed_danger(self, grid, bombs, players, extra_bomb=None, default_radius=2):
-        bomb_infos = self._bomb_infos(
-            grid,
-            bombs,
-            players,
-            default_radius=default_radius,
-            extra_bomb=extra_bomb,
-        )
-        if not bomb_infos:
-            return {}, {}
-
-        times = self._chain_times(bomb_infos)
-        danger_time = {}
-        block_until = {}
-
-        for info, timer in zip(bomb_infos, times):
-            block_until[info["pos"]] = timer
-            for tile in info["blast"]:
-                old = danger_time.get(tile)
-                if old is None or timer < old:
-                    danger_time[tile] = timer
-
-        return danger_time, block_until
 
     def _open_neighbors(self, grid, pos, occupied):
         cnt = 0
@@ -315,57 +273,10 @@ class Agent:
                 q.append((npos, d + 1, a if first_action is None else first_action))
         return None
 
-    def _can_escape_after_placing(self, grid, my_pos, occupied, bombs, players, bomb_radius):
-        extra_bomb = {
-            "pos": my_pos,
-            "timer": 7,
-            "radius": bomb_radius,
-        }
-        danger_time, block_until = self._timed_danger(
-            grid,
-            bombs,
-            players,
-            extra_bomb=extra_bomb,
-        )
-
-        q = deque([(my_pos, 0, None)])
-        seen = {(my_pos, 0)}
-
-        while q:
-            pos, t, first_action = q.popleft()
-
-            if t > 0:
-                first_danger = danger_time.get(pos)
-                if first_danger is None:
-                    return True
-
-            if t >= 8:
-                continue
-
-            for a in [1, 2, 3, 4, 0]:
-                nx, ny = self._next_pos(pos, a)
-                npos = (nx, ny)
-                nt = t + 1
-
-                if a != 0 and not self._passable(grid, nx, ny):
-                    continue
-                if npos in occupied and npos != my_pos:
-                    continue
-                state = (npos, nt)
-                if state in seen:
-                    continue
-
-                blocked_until = block_until.get(npos)
-                if blocked_until is not None and nt <= blocked_until and npos != pos:
-                    continue
-
-                if danger_time.get(npos) == nt:
-                    continue
-
-                seen.add(state)
-                q.append((npos, nt, a if first_action is None else first_action))
-
-        return False
+    def _can_escape_after_placing(self, grid, my_pos, occupied, danger_soon, bomb_radius):
+        my_blast = self._blast_tiles(grid, my_pos[0], my_pos[1], bomb_radius)
+        combined = set(danger_soon) | my_blast
+        return self._move_to_nearest_safe(grid, my_pos, occupied, combined) is not None
 
     def _count_boxes_in_blast(self, grid, my_pos, radius):
         return sum(

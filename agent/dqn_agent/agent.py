@@ -1,4 +1,5 @@
 from pathlib import Path
+import os
 import numpy as np
 from tqdm import tqdm
 import argparse
@@ -39,13 +40,12 @@ class ReplayBuffer:
         self.actions     = np.zeros(capacity,              dtype=np.int64)
         self.rewards     = np.zeros(capacity,              dtype=np.float32)
         self.dones       = np.zeros(capacity,              dtype=np.float32)
+        self.next_action_masks = np.ones((capacity, 6),     dtype=np.float32)
 
     def __len__(self):
         return self.size
 
-    def push(self, map_state, aux_state, action, reward, next_map_state, next_aux_state, done):
-        self.pos  = (self.pos + 1) % self.capacity
-        self.size = min(self.size + 1, self.capacity)
+    def push(self, map_state, aux_state, action, reward, next_map_state, next_aux_state, done, next_action_mask=None):
         self.map_states[self.pos]      = map_state
         self.aux_states[self.pos]      = aux_state
         self.next_map_states[self.pos] = next_map_state
@@ -53,6 +53,12 @@ class ReplayBuffer:
         self.actions[self.pos]     = action
         self.rewards[self.pos]     = reward
         self.dones[self.pos]       = done
+        if next_action_mask is None:
+            self.next_action_masks[self.pos] = 1.0
+        else:
+            self.next_action_masks[self.pos] = next_action_mask
+        self.pos  = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
 
     def sample(self, batch_size: int):
         idx = np.random.randint(0, self.size, size=batch_size)
@@ -64,6 +70,7 @@ class ReplayBuffer:
             self.actions[idx],
             self.rewards[idx],
             self.dones[idx],
+            self.next_action_masks[idx],
         )
 
 class DQNModel(nn.Module):
@@ -109,22 +116,20 @@ class DQNModel(nn.Module):
         feat = torch.cat([map_feat, aux_feat], dim=1)
         return self.head(feat)
 
-def encode_obs(obs, agent_ids):
+def encode_obs(obs, agent_ids, output_channels=12):
     """
     Returns:
       map_feat: spatial tensor for Conv2D branch, shape (C, H, W)
       aux_feat: scalar tensor for auxiliary branch, shape (A,)
 
-    agent_ids: int (user's player id) or list/tuple [user_id, opp_id].
-    When a single int is given the enemy is inferred as the other
-    player in a 2-player game (1 - user_id).
+    agent_ids: list/tuple whose first item is the controlled player id.
+    output_channels=12 is the fixed 4-player encoder used for new training.
+    output_channels=9 keeps compatibility with the old bundled checkpoint.
     """
     if obs is None:
         raise ValueError("obs should not be None")
 
-    # Normalise agent_ids to (user_id, opp_id)
     user_id = int(agent_ids[0])
-    opp_id  = int(agent_ids[1]) if len(agent_ids) > 1 else (1 - user_id)
 
     grid    = obs["map"]      # (H, W)
     players = obs["players"]  # (num_players, 5)
@@ -135,40 +140,258 @@ def encode_obs(obs, agent_ids):
     map_channels = []
     for v in [Map.GRASS, Map.WALL, Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY]:
         map_channels.append((grid == v).astype(np.float32))
-    # Player position masks
     my_x, my_y, my_alive, my_bombs_left, my_radius_bonus = players[user_id]
-    ox,   oy,   opp_alive, _,            _               = players[opp_id]
     my_pos  = np.zeros((H, W), dtype=np.float32)
-    opp_pos = np.zeros((H, W), dtype=np.float32)
+    enemy_pos = np.zeros((H, W), dtype=np.float32)
     if int(my_alive)  == 1:
         my_pos[int(my_x), int(my_y)] = 1.0
-    if int(opp_alive) == 1:
-        opp_pos[int(ox), int(oy)]    = 1.0
+
+    enemies_alive = 0
+    nearest_enemy_dist = H + W
+    for pid, p in enumerate(players):
+        if pid == user_id or int(p[2]) != 1:
+            continue
+        enemies_alive += 1
+        ex, ey = int(p[0]), int(p[1])
+        enemy_pos[ex, ey] = 1.0
+        nearest_enemy_dist = min(nearest_enemy_dist, abs(int(my_x) - ex) + abs(int(my_y) - ey))
 
     # Bomb channels — bombs is a numpy array, not a list of Bomb objects
+    effective_timers = _effective_bomb_timers_np(grid, players, bombs)
     bomb_timer = np.zeros((H, W), dtype=np.float32)
     bomb_owned = np.zeros((H, W), dtype=np.float32)
-    for b in bombs:
+    enemy_bomb = np.zeros((H, W), dtype=np.float32)
+    for idx, b in enumerate(bombs):
         bx, by, timer, owner_id = b
         bx, by = int(bx), int(by)
-        t = float(timer) / BOMB_MAX_TIMER  # normalise by default max timer
+        t = float(effective_timers.get(idx, int(timer))) / BOMB_MAX_TIMER
         bomb_timer[bx, by] = max(bomb_timer[bx, by], t)
-        bomb_owned[bx, by] = 1.0 if int(owner_id) == user_id else 0.0
+        if int(owner_id) == user_id:
+            bomb_owned[bx, by] = 1.0
+        else:
+            enemy_bomb[bx, by] = 1.0
 
     scalar = np.array([
         float(my_bombs_left)   / Player.MAX_BOMB_CAPACITY,
         float(my_radius_bonus) / Player.MAX_BOMB_RADIUS,
-        float(opp_alive),
+        float(enemies_alive) / max(1.0, float(len(players) - 1)),
+        float(nearest_enemy_dist) / float(H + W),
     ], dtype=np.float32)
+
+    if output_channels == 9:
+        map_feat = np.stack([
+            *map_channels,
+            my_pos,
+            enemy_pos,
+            bomb_timer,
+            bomb_owned,
+        ], axis=0).astype(np.float32)
+        return map_feat, scalar[:3]
 
     map_feat = np.stack([
         *map_channels,          # 5 channels
         my_pos,                 # 1 channel
-        opp_pos,                # 1 channel
+        enemy_pos,              # 1 channel
         bomb_timer,             # 1 channel
         bomb_owned,             # 1 channel
-    ], axis=0).astype(np.float32)  # (9, H, W)
+        enemy_bomb,             # 1 channel
+        _danger_channel(grid, players, bombs),  # 1 channel
+        np.zeros((H, W), dtype=np.float32),     # reserved channel
+    ], axis=0).astype(np.float32)  # (12, H, W)
     return map_feat, scalar
+
+
+def _danger_channel(grid, players, bombs):
+    danger = np.zeros_like(grid, dtype=np.float32)
+    effective_timers = _effective_bomb_timers_np(grid, players, bombs)
+    for idx, b in enumerate(bombs):
+        bx, by, timer, owner_id = [int(v) for v in b]
+        timer = effective_timers.get(idx, timer)
+        if timer > 3:
+            continue
+        radius = 1
+        if 0 <= owner_id < len(players):
+            radius = 1 + int(players[owner_id][4])
+        for x, y in _blast_tiles_np(grid, bx, by, radius):
+            danger[x, y] = max(danger[x, y], (4.0 - float(timer)) / 3.0)
+    return danger
+
+
+def _effective_bomb_timers_np(grid, players, bombs):
+    bombs_arr = list(bombs)
+    if not bombs_arr:
+        return {}
+
+    timers = {}
+    blasts = {}
+    for idx, b in enumerate(bombs_arr):
+        bx, by, timer, owner_id = [int(v) for v in b]
+        radius = 1
+        if 0 <= owner_id < len(players):
+            radius = 1 + int(players[owner_id][4])
+        timers[idx] = int(timer)
+        blasts[idx] = set(_blast_tiles_np(grid, bx, by, radius))
+
+    changed = True
+    while changed:
+        changed = False
+        for trigger_idx, trigger_tiles in blasts.items():
+            trigger_timer = timers[trigger_idx]
+            for target_idx, b in enumerate(bombs_arr):
+                if target_idx == trigger_idx:
+                    continue
+                bx, by = int(b[0]), int(b[1])
+                if (bx, by) in trigger_tiles and timers[target_idx] > trigger_timer:
+                    timers[target_idx] = trigger_timer
+                    changed = True
+    return timers
+
+
+def _blast_tiles_np(grid, bx, by, radius):
+    tiles = [(bx, by)]
+    h, w = grid.shape
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        for r in range(1, radius + 1):
+            x, y = bx + dx * r, by + dy * r
+            if not (0 <= x < h and 0 <= y < w):
+                break
+            cell = int(grid[x, y])
+            if cell == Map.WALL:
+                break
+            tiles.append((x, y))
+            if cell == Map.BOX:
+                break
+    return tiles
+
+
+def legal_actions(obs, agent_id):
+    grid = obs["map"]
+    players = obs["players"]
+    bombs = obs["bombs"]
+    if int(players[agent_id][2]) != 1:
+        return [0]
+
+    x, y = int(players[agent_id][0]), int(players[agent_id][1])
+    bomb_positions = {(int(b[0]), int(b[1])) for b in bombs}
+    actions = [0]
+
+    for action, (dx, dy) in {
+        1: (-1, 0),
+        2: (1, 0),
+        3: (0, -1),
+        4: (0, 1),
+    }.items():
+        nx, ny = x + dx, y + dy
+        if not (0 <= nx < grid.shape[0] and 0 <= ny < grid.shape[1]):
+            continue
+        if int(grid[nx, ny]) in (Map.WALL, Map.BOX):
+            continue
+        if (nx, ny) in bomb_positions:
+            continue
+        actions.append(action)
+
+    if int(players[agent_id][3]) > 0 and (x, y) not in bomb_positions:
+        actions.append(5)
+    return actions
+
+
+def action_mask(valid_actions, num_actions=6):
+    mask = np.zeros(num_actions, dtype=np.float32)
+    for action in valid_actions:
+        if 0 <= int(action) < num_actions:
+            mask[int(action)] = 1.0
+    if mask.sum() == 0:
+        mask[0] = 1.0
+    return mask
+
+
+def _empty_episode_stats(num_players=4):
+    return [
+        {"kills": 0, "boxes": 0, "items": 0, "bombs": 0}
+        for _ in range(num_players)
+    ]
+
+
+def _update_episode_stats(stats, prev_obs, next_obs, actions):
+    prev_players = prev_obs["players"]
+    next_players = next_obs["players"]
+    prev_grid = prev_obs["map"]
+    next_grid = next_obs["map"]
+    prev_bombs = prev_obs["bombs"]
+    prev_bomb_positions = {(int(b[0]), int(b[1])) for b in prev_bombs}
+
+    for pid, action in enumerate(actions):
+        if int(prev_players[pid][2]) != 1:
+            continue
+        px, py = int(prev_players[pid][0]), int(prev_players[pid][1])
+        if (
+            int(action) == 5
+            and int(prev_players[pid][3]) > 0
+            and (px, py) not in prev_bomb_positions
+        ):
+            stats[pid]["bombs"] += 1
+
+        nx, ny = int(next_players[pid][0]), int(next_players[pid][1])
+        occupants = sum(
+            1
+            for p in next_players
+            if int(p[2]) == 1 and int(p[0]) == nx and int(p[1]) == ny
+        )
+        if (
+            int(next_players[pid][2]) == 1
+            and int(prev_grid[nx, ny]) in (Map.ITEM_RADIUS, Map.ITEM_CAPACITY)
+            and occupants == 1
+        ):
+            stats[pid]["items"] += 1
+
+    for x, y in np.argwhere((prev_grid == Map.BOX) & (next_grid != Map.BOX)):
+        owner = _owner_of_blast_tile(prev_obs, int(x), int(y))
+        if owner is not None and 0 <= owner < len(stats):
+            stats[owner]["boxes"] += 1
+
+    for victim_id, prev_player in enumerate(prev_players):
+        if int(prev_player[2]) != 1 or int(next_players[victim_id][2]) == 1:
+            continue
+        vx, vy = int(prev_player[0]), int(prev_player[1])
+        owner = _owner_of_blast_tile(prev_obs, vx, vy)
+        if owner is not None and owner != victim_id and 0 <= owner < len(stats):
+            stats[owner]["kills"] += 1
+
+
+def _owner_of_blast_tile(obs, x, y):
+    grid = obs["map"]
+    players = obs["players"]
+    for b in obs["bombs"]:
+        bx, by, _timer, owner_id = [int(v) for v in b]
+        radius = 1
+        if 0 <= owner_id < len(players):
+            radius = 1 + int(players[owner_id][4])
+        if (x, y) in _blast_tiles_np(grid, bx, by, radius):
+            return owner_id
+    return None
+
+
+def _ranking_key_from_stats(stats, players, pid):
+    alive = 1 if int(players[pid][2]) == 1 else 0
+    return (
+        alive,
+        int(stats[pid]["kills"]),
+        int(stats[pid]["boxes"]),
+        int(stats[pid]["items"]),
+        int(stats[pid]["bombs"]),
+    )
+
+
+def _tiebreak_rank(stats, players, agent_id):
+    keys = [_ranking_key_from_stats(stats, players, pid) for pid in range(len(stats))]
+    my_key = keys[agent_id]
+    return sum(1 for key in keys if key > my_key)
+
+
+def _terminal_tiebreak_bonus(stats, players, agent_id):
+    rank = _tiebreak_rank(stats, players, agent_id)
+    bonuses = [8.0, 3.0, -2.0, -5.0]
+    return bonuses[min(rank, len(bonuses) - 1)]
 
 class TrainingAgent:
     """
@@ -208,7 +431,7 @@ class TrainingAgent:
         
         self.loss_fn = nn.MSELoss()
 
-    def act(self, map_state, aux_state, epsilon=0.0):
+    def act(self, map_state, aux_state, epsilon=0.0, valid_actions=None):
         """
         Take an action based on the state.
         Args:
@@ -218,20 +441,27 @@ class TrainingAgent:
         Returns:
             action: int
         """
+        valid_actions = list(range(self.num_actions)) if valid_actions is None else list(valid_actions)
+        if not valid_actions:
+            return 0
+
         # Epsilon-Greedy Action Selection
         if random.random() < epsilon:
-            return random.randint(0, self.num_actions - 1)
+            return random.choice(valid_actions)
         
         map_tensor = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
         aux_tensor = torch.from_numpy(aux_state).unsqueeze(0).to(self.device)
 
         with torch.no_grad():
-            action = self.q_net(map_tensor, aux_tensor).argmax().item()
+            q_values = self.q_net(map_tensor, aux_tensor).squeeze(0)
+            mask = torch.full_like(q_values, -1e9)
+            mask[torch.tensor(valid_actions, dtype=torch.long, device=self.device)] = 0.0
+            action = (q_values + mask).argmax().item()
             
         # action with the highest predicted Q-value
         return action
 
-    def train_step(self, map_state, aux_state, next_map_state, next_aux_state, action, reward, done):
+    def train_step(self, map_state, aux_state, next_map_state, next_aux_state, action, reward, done, next_action_mask):
         """
         Train the DQN agent for one step.
         Args:
@@ -251,6 +481,7 @@ class TrainingAgent:
         action_t     = torch.from_numpy(action).unsqueeze(1)
         reward_t     = torch.from_numpy(reward).unsqueeze(1)
         done_t       = torch.from_numpy(done).unsqueeze(1)
+        next_action_mask_t = torch.from_numpy(next_action_mask)
         if self.device != "cpu":
             map_state_t      = map_state_t.to(self.device)
             aux_state_t      = aux_state_t.to(self.device)
@@ -259,6 +490,7 @@ class TrainingAgent:
             action_t     = action_t.to(self.device)
             reward_t     = reward_t.to(self.device)
             done_t       = done_t.to(self.device)
+            next_action_mask_t = next_action_mask_t.to(self.device)
 
         # 2. Calculate current Q-values: Q(s, a)
         # gather() extracts the Q-value for the specific action taken
@@ -271,7 +503,9 @@ class TrainingAgent:
             # ~ Q(s, a) = r + gamma * max_a' {Q(s', a', weights)} if not done else Q(s, a) = r
         # inference_mode is stricter than no_grad: disables autograd engine entirely
         with torch.no_grad():
-            max_next_q = self.target_net(next_map_state_t, next_aux_state_t).max(1)[0].unsqueeze(1)
+            next_q = self.target_net(next_map_state_t, next_aux_state_t)
+            next_q = next_q.masked_fill(next_action_mask_t <= 0.0, -1e9)
+            max_next_q = next_q.max(1)[0].unsqueeze(1)
             target_q   = reward_t + self.gamma * max_next_q * (1 - done_t)
 
         loss = self.loss_fn(q_values, target_q)
@@ -299,7 +533,18 @@ class TrainingAgent:
         self.global_step = checkpoint["global_step"]
         self.epsilon = checkpoint["epsilon"]
 
-def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, seed=86, save_model=True, pretrained_model=None):
+def train_dqn(
+    user_id=0,
+    enemy_type="simple",
+    num_episodes=100,
+    max_steps=500,
+    seed=86,
+    save_model=True,
+    pretrained_model=None,
+    epsilon_start=0.40,
+    epsilon_min=0.03,
+    epsilon_decay=0.997,
+):
     # Training-only imports - placed here so they don't run when the evaluator loads this file
     import sys as _sys
     from pathlib import Path as _Path
@@ -314,34 +559,42 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
     from engine import BomberEnv 
 
     env = BomberEnv(max_steps=max_steps, seed=seed)
-    if enemy_type == "simple":
-        enemy_agent = SimpleRuleAgent(1)
-    elif enemy_type == "smarter":
-        enemy_agent = SmarterRuleAgent(1)
-    elif enemy_type == "tactical":
-        enemy_agent = TacticalRuleAgent(1)
-    elif enemy_type == "genius":
-        enemy_agent = GeniusRuleAgent(1)
-    elif enemy_type == "box_farmer":
-        enemy_agent = BoxFarmerAgent(1)
-    else:
-        raise ValueError(f"Invalid enemy type: {enemy_type}")
+
+    def make_enemy(agent_id, kind=None):
+        kind = enemy_type if kind is None else kind
+        if kind == "mixed":
+            kind = random.choice(["simple", "smarter", "tactical", "genius", "box_farmer"])
+        if kind == "simple":
+            return SimpleRuleAgent(agent_id)
+        if kind == "smarter":
+            return SmarterRuleAgent(agent_id)
+        if kind == "tactical":
+            return TacticalRuleAgent(agent_id)
+        if kind == "genius":
+            return GeniusRuleAgent(agent_id)
+        if kind == "box_farmer":
+            return BoxFarmerAgent(agent_id)
+        raise ValueError(f"Invalid enemy type: {kind}")
+
+    def make_enemy_agents():
+        return [make_enemy(i) for i in range(4) if i != user_id]
+
+    enemy_agents = make_enemy_agents()
 
     # hyperparam
-    epsilon_start      = 1.0
-    epsilon_min        = 0.05
-    epsilon_decay      = 0.995
     epsilon            = epsilon_start
     batch_size         = 64
     lr                 = 1e-3
 
     dummy_obs = env.reset(seed=seed)
-    agent_ids = [user_id, enemy_agent.agent_id]
-    sample_state = encode_obs(dummy_obs, agent_ids=agent_ids)
+    agent_ids = [user_id]
+    sample_state = encode_obs(dummy_obs, agent_ids=agent_ids, output_channels=12)
     input_spec = (sample_state[0].shape, sample_state[1].shape[0])
     num_actions = 6
 
     user_agent = TrainingAgent(user_id, input_spec, num_actions, lr=lr, device="cuda" if torch.cuda.is_available() else "cpu", pretrained_model=pretrained_model)
+    input_spec = (user_agent.map_shape, user_agent.aux_dim)
+    encode_channels = int(user_agent.map_shape[0])
     buffer = ReplayBuffer(capacity=10_000, map_shape=input_spec[0], aux_dim=input_spec[1])
 
     global_step = 0
@@ -350,40 +603,64 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
     win_history = []
     with tqdm(total=num_episodes, desc="Training DQN") as pbar:
         for ep in range(num_episodes):
+            if enemy_type == "mixed":
+                enemy_agents = make_enemy_agents()
             obs = env.reset(seed=seed + ep)
             done = False
-            prev_obs = None
             total_reward = 0
+            episode_stats = _empty_episode_stats(num_players=len(obs["players"]))
 
-            map_state, aux_state = encode_obs(obs, agent_ids)
+            map_state, aux_state = encode_obs(obs, agent_ids, output_channels=encode_channels)
 
             for _ in range(max_steps):
                 # 1. Action
-                user_action  = user_agent.act(map_state, aux_state, epsilon=epsilon)
-                enemy_action = enemy_agent.act(obs)
-                actions = [None, None]
-                actions[user_id]              = user_action
-                actions[enemy_agent.agent_id] = enemy_action
+                user_action = user_agent.act(
+                    map_state,
+                    aux_state,
+                    epsilon=epsilon,
+                    valid_actions=legal_actions(obs, user_id),
+                )
+                actions = [0, 0, 0, 0]
+                actions[user_id] = user_action
+                for enemy_agent in enemy_agents:
+                    actions[enemy_agent.agent_id] = enemy_agent.act(obs)
 
                 # 2. Environment Step
                 next_obs, terminated, truncated = env.step(actions)
                 done = terminated or truncated
+                _update_episode_stats(episode_stats, obs, next_obs, actions)
 
                 # 3. Reward
-                r = compute_reward(prev_obs, next_obs, agent_id=user_id)
+                r = compute_reward(obs, next_obs, agent_id=user_id)
+                if done:
+                    r += _terminal_tiebreak_bonus(episode_stats, next_obs["players"], user_id)
                 total_reward += r
                 reward_history.append(r)
                 if done:
-                    win_history.append(1 if next_obs["players"][user_id][2] else 0)
+                    win_history.append(1 if _tiebreak_rank(episode_stats, next_obs["players"], user_id) == 0 else 0)
                 
                 # 4. Buffer Push
-                next_map_state, next_aux_state = encode_obs(next_obs, agent_ids)
-                buffer.push(map_state, aux_state, user_action, r, next_map_state, next_aux_state, done)
+                next_map_state, next_aux_state = encode_obs(
+                    next_obs,
+                    agent_ids,
+                    output_channels=encode_channels,
+                )
+                next_valid_mask = action_mask(legal_actions(next_obs, user_id), num_actions)
+                buffer.push(
+                    map_state,
+                    aux_state,
+                    user_action,
+                    r,
+                    next_map_state,
+                    next_aux_state,
+                    done,
+                    next_valid_mask,
+                )
 
                 # 5. Train
                 global_step += 1
                 if len(buffer) >= batch_size:
-                    sampled_map_state, sampled_aux_state, sampled_next_map_state, sampled_next_aux_state, sampled_action, sampled_reward, sampled_done = buffer.sample(batch_size)
+                    sampled_map_state, sampled_aux_state, sampled_next_map_state, sampled_next_aux_state, sampled_action, sampled_reward, sampled_done, sampled_next_action_mask = buffer.sample(batch_size)
                     loss = user_agent.train_step(
                         sampled_map_state,
                         sampled_aux_state,
@@ -392,11 +669,11 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
                         sampled_action,
                         sampled_reward,
                         sampled_done,
+                        sampled_next_action_mask,
                     )
                     loss_history.append(loss)
 
                 # 6. Update
-                prev_obs  = obs
                 obs       = next_obs
                 map_state = next_map_state
                 aux_state = next_aux_state
@@ -406,14 +683,17 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
                     break
 
             epsilon = max(epsilon_min, epsilon * epsilon_decay)
+            user_agent.epsilon = epsilon
             if ep % 10 == 0:
                 user_agent.update_target_network()
             pbar.update(1)
             pbar.set_postfix(reward=f"{total_reward:.2f}", epsilon=f"{epsilon:.3f}")
 
     model_folder = f"ckpts/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed"
+    Path(model_folder).mkdir(parents=True, exist_ok=True)
     if save_model:
         model_path = f"{model_folder}/{user_agent.global_step}_global_step.pth"
+        submission_model_path = Path(__file__).resolve().parent / "model.pth"
         save_model_fn(user_agent.q_net, 
                     user_agent.optimizer, 
                     user_agent.global_step, 
@@ -422,6 +702,14 @@ def train_dqn(user_id=0, enemy_type="simple", num_episodes=100, max_steps=500, s
                     input_spec,
                     num_actions,
                     model_path)
+        save_model_fn(user_agent.q_net,
+                    user_agent.optimizer,
+                    user_agent.global_step,
+                    user_agent.epsilon,
+                    user_agent.lr,
+                    input_spec,
+                    num_actions,
+                    str(submission_model_path))
         
     plot_loss(loss_history=loss_history, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_loss.png")
     plot_rewards(reward_history=reward_history, save_path=f"{model_folder}/dqn_{enemy_type}_{num_episodes}_episodes_{max_steps}_steps_{seed}_seed_rewards.png")
@@ -432,13 +720,16 @@ def training():
     from utils import seed_everything
     
     parser = argparse.ArgumentParser()
-    parser.add_argument("--enemy_type", type=str, default="simple", choices=["simple", "smarter", "tactical", "genius", "box_farmer"])
+    parser.add_argument("--enemy_type", type=str, default="simple", choices=["simple", "smarter", "tactical", "genius", "box_farmer", "mixed"])
     parser.add_argument("--num_episodes", type=int, default=200, help="Number of episodes to train")
     parser.add_argument("--max_steps", type=int, default=500, help="Maximum number of steps per episode")
     parser.add_argument("--seed", type=int, default=86, help="Random seed for reproducibility")
     parser.add_argument("--save_model", action="store_true", help="Save model")
     parser.add_argument("--load_model", type=str, default=None, help="Load model")
     parser.add_argument("--skip_training", action="store_true", help="Skip training")
+    parser.add_argument("--epsilon_start", type=float, default=0.40, help="Initial epsilon for exploration")
+    parser.add_argument("--epsilon_min", type=float, default=0.03, help="Minimum epsilon")
+    parser.add_argument("--epsilon_decay", type=float, default=0.997, help="Episode-level epsilon decay")
     args = parser.parse_args()
     
     seed_everything(args.seed)
@@ -449,7 +740,10 @@ def training():
                     max_steps=args.max_steps, 
                     seed=args.seed, 
                     save_model=args.save_model,
-                    pretrained_model=args.load_model)
+                    pretrained_model=args.load_model,
+                    epsilon_start=args.epsilon_start,
+                    epsilon_min=args.epsilon_min,
+                    epsilon_decay=args.epsilon_decay)
     
 # Mandatory for submission
 class Agent:
@@ -462,9 +756,44 @@ class Agent:
         self.aux_dim = 3
         self.num_actions = 6
         
-        # Load checkpoint from same directory as this file
-        checkpoint_path = Path(__file__).parent / "2737502_global_step.pth"
+        checkpoint_path = self._resolve_checkpoint_path()
         self._load_checkpoint(str(checkpoint_path))
+
+    def _resolve_checkpoint_path(self):
+        here = Path(__file__).resolve().parent
+        repo_root = here.parent.parent
+
+        env_path = os.environ.get("DQN_CHECKPOINT")
+        candidates = []
+        if env_path:
+            candidates.append(Path(env_path))
+
+        candidates.extend([
+            here / "model.pth",
+            here / "latest_global_step.pth",
+        ])
+
+        candidates.extend(sorted(
+            here.glob("*_global_step.pth"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        ))
+
+        ckpt_root = repo_root / "ckpts"
+        if ckpt_root.exists():
+            candidates.extend(sorted(
+                ckpt_root.glob("**/*.pth"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            ))
+
+        for path in candidates:
+            if path.exists():
+                return path
+
+        raise FileNotFoundError(
+            "No DQN checkpoint found. Train with --save_model first, or set DQN_CHECKPOINT to a .pth file."
+        )
     
     def _load_checkpoint(self, checkpoint_path):
         """Load trained model from checkpoint."""
@@ -500,7 +829,11 @@ class Agent:
         """
         try:
             # Encode observation
-            map_state, aux_state = encode_obs(obs, [self.agent_id])
+            map_state, aux_state = encode_obs(
+                obs,
+                [self.agent_id],
+                output_channels=int(self.map_shape[0]),
+            )
             
             # Convert to tensors and add batch dimension
             map_tensor = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
@@ -508,8 +841,11 @@ class Agent:
             
             # Get Q-values and select best action
             with torch.no_grad():
-                q_values = self.q_net(map_tensor, aux_tensor)
-                action = q_values.argmax(dim=1).item()
+                q_values = self.q_net(map_tensor, aux_tensor).squeeze(0)
+                valid = legal_actions(obs, self.agent_id)
+                mask = torch.full_like(q_values, -1e9)
+                mask[torch.tensor(valid, dtype=torch.long, device=self.device)] = 0.0
+                action = (q_values + mask).argmax().item()
             
             return action
         except Exception as e:

@@ -264,6 +264,133 @@ def _blast_tiles_np(grid, bx, by, radius):
     return tiles
 
 
+def _is_passable_for_escape(grid, x, y, bomb_positions):
+    if not (0 <= x < grid.shape[0] and 0 <= y < grid.shape[1]):
+        return False
+    if int(grid[x, y]) in (Map.WALL, Map.BOX):
+        return False
+    if (x, y) in bomb_positions:
+        return False
+    return True
+
+
+def _bombs_with_fake(obs, agent_id, fake_timer=7):
+    bombs = [tuple(int(v) for v in b) for b in obs["bombs"]]
+    players = obs["players"]
+    x, y = int(players[agent_id][0]), int(players[agent_id][1])
+    bombs.append((x, y, int(fake_timer), int(agent_id)))
+    return np.asarray(bombs, dtype=np.int32)
+
+
+def _danger_tiles_by_time(grid, players, bombs):
+    effective_timers = _effective_bomb_timers_np(grid, players, bombs)
+    danger = {}
+    for idx, b in enumerate(bombs):
+        bx, by, timer, owner_id = [int(v) for v in b]
+        timer = effective_timers.get(idx, timer)
+        radius = 1
+        if 0 <= owner_id < len(players):
+            radius = 1 + int(players[owner_id][4])
+        for tile in _blast_tiles_np(grid, bx, by, radius):
+            danger[tile] = min(danger.get(tile, BOMB_MAX_TIMER + 1), int(timer))
+    return danger
+
+
+def _can_escape_after_placing(obs, agent_id, horizon=7):
+    grid = obs["map"]
+    players = obs["players"]
+    sx, sy = int(players[agent_id][0]), int(players[agent_id][1])
+    bombs = _bombs_with_fake(obs, agent_id, fake_timer=BOMB_MAX_TIMER)
+    bomb_positions = {(int(b[0]), int(b[1])) for b in bombs}
+    danger_at = _danger_tiles_by_time(grid, players, bombs)
+    fake_blast = set(
+        _blast_tiles_np(
+            grid,
+            sx,
+            sy,
+            1 + int(players[agent_id][4]),
+        )
+    )
+
+    queue = [(sx, sy, 0)]
+    seen = {(sx, sy, 0)}
+    while queue:
+        x, y, t = queue.pop(0)
+        if t > 0 and (x, y) not in fake_blast and danger_at.get((x, y), BOMB_MAX_TIMER + 1) > t:
+            return True
+        if t >= horizon:
+            continue
+        for dx, dy in ((0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)):
+            nx, ny = x + dx, y + dy
+            nt = t + 1
+            if not _is_passable_for_escape(grid, nx, ny, bomb_positions):
+                continue
+            if danger_at.get((nx, ny), BOMB_MAX_TIMER + 1) <= nt:
+                continue
+            state = (nx, ny, nt)
+            if state in seen:
+                continue
+            seen.add(state)
+            queue.append(state)
+    return False
+
+
+def _count_bomb_targets(obs, agent_id):
+    grid = obs["map"]
+    players = obs["players"]
+    x, y = int(players[agent_id][0]), int(players[agent_id][1])
+    radius = 1 + int(players[agent_id][4])
+    tiles = set(_blast_tiles_np(grid, x, y, radius))
+    boxes = sum(1 for tx, ty in tiles if int(grid[tx, ty]) == Map.BOX)
+    enemies = sum(
+        1
+        for pid, p in enumerate(players)
+        if pid != agent_id and int(p[2]) == 1 and (int(p[0]), int(p[1])) in tiles
+    )
+    return boxes, enemies
+
+
+def _nearest_value_distance(obs, agent_id):
+    grid = obs["map"]
+    x, y = int(obs["players"][agent_id][0]), int(obs["players"][agent_id][1])
+    best = None
+    for tx, ty in np.argwhere(np.isin(grid, [Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY])):
+        d = abs(x - int(tx)) + abs(y - int(ty))
+        best = d if best is None else min(best, d)
+    return best
+
+
+def _action_shaping_reward(obs, next_obs, agent_id, action, stop_streak):
+    if int(obs["players"][agent_id][2]) != 1:
+        return 0.0
+
+    reward = 0.0
+    x, y = int(obs["players"][agent_id][0]), int(obs["players"][agent_id][1])
+    currently_dangerous = _danger_channel(obs["map"], obs["players"], obs["bombs"])[x, y] > 0.0
+
+    if int(action) == 0 and not currently_dangerous:
+        reward -= 0.045 + 0.020 * min(6, int(stop_streak))
+        value_dist = _nearest_value_distance(obs, agent_id)
+        if value_dist is not None and value_dist <= 3:
+            reward -= 0.060
+
+    if int(action) in (1, 2, 3, 4):
+        nx, ny = int(next_obs["players"][agent_id][0]), int(next_obs["players"][agent_id][1])
+        if (nx, ny) != (x, y):
+            reward += 0.015
+
+    if int(action) == 5:
+        boxes, enemies = _count_bomb_targets(obs, agent_id)
+        can_escape = _can_escape_after_placing(obs, agent_id)
+        if boxes or enemies:
+            reward += 0.20 * min(3, boxes) + 0.45 * enemies
+        else:
+            reward -= 0.18
+        reward += 0.18 if can_escape else -0.85
+
+    return float(reward)
+
+
 def legal_actions(obs, agent_id):
     grid = obs["map"]
     players = obs["players"]
@@ -447,6 +574,8 @@ class TrainingAgent:
 
         # Epsilon-Greedy Action Selection
         if random.random() < epsilon:
+            if 0 in valid_actions and len(valid_actions) > 1 and random.random() < 0.85:
+                return random.choice([a for a in valid_actions if a != 0])
             return random.choice(valid_actions)
         
         map_tensor = torch.from_numpy(map_state).unsqueeze(0).to(self.device)
@@ -616,6 +745,7 @@ def train_dqn(
             obs = env.reset(seed=seed + ep)
             done = False
             total_reward = 0
+            stop_streak = 0
             episode_stats = _empty_episode_stats(num_players=len(obs["players"]))
 
             map_state, aux_state = encode_obs(obs, agent_ids, output_channels=encode_channels)
@@ -640,6 +770,7 @@ def train_dqn(
 
                 # 3. Reward
                 r = compute_reward(obs, next_obs, agent_id=user_id)
+                r += _action_shaping_reward(obs, next_obs, user_id, user_action, stop_streak)
                 if done:
                     r += _terminal_tiebreak_bonus(episode_stats, next_obs["players"], user_id)
                 total_reward += r
@@ -684,6 +815,10 @@ def train_dqn(
                         user_agent.update_target_network()
 
                 # 6. Update
+                if int(user_action) == 0:
+                    stop_streak += 1
+                else:
+                    stop_streak = 0
                 obs       = next_obs
                 map_state = next_map_state
                 aux_state = next_aux_state

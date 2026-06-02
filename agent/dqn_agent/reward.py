@@ -28,16 +28,18 @@ REWARD_DICT = {
     "win": 12.0,
     "enemy_death": 5.0,
     "agent_death": -8.0,
-    "standing_still": -0.015,
-    "time_penalty": -0.002,
+    "standing_still": -0.055,
+    "moving": 0.010,
+    "idle_near_value": -0.045,
+    "time_penalty": -0.004,
     "bomb_placed": 0.06,
     "plant_near_box": 0.65,
     "box_target": 0.35,
     "box_destroyed": 0.80,
     "item_collection": 0.45,
     "danger_evasion": 0.08,
-    "danger_enter": -0.12,
-    "own_blast_loiter": -0.08,
+    "danger_enter": -0.16,
+    "own_blast_loiter": -0.12,
     "approach_enemy": 0.005,
 }
 
@@ -247,6 +249,15 @@ def _manhattan_to_nearest_alive_enemy(players, agent_id, x, y):
     return best
 
 
+def _nearest_item_or_box_distance(grid, x, y):
+    best = None
+    ix, iy = int(x), int(y)
+    for tx, ty in np.argwhere(np.isin(grid, [Map.BOX, Map.ITEM_RADIUS, Map.ITEM_CAPACITY])):
+        d = abs(ix - int(tx)) + abs(iy - int(ty))
+        best = d if best is None else min(best, d)
+    return best
+
+
 def _in_own_predicted_blast(obs, agent_id, x, y):
     return _min_own_blast_timer_at(obs, agent_id, x, y) is not None
 
@@ -322,9 +333,14 @@ def compute_reward(prev_obs, curr_obs, agent_id):
     if prev_x == curr_x and prev_y == curr_y:
         reward += REWARD_DICT["standing_still"]
     else:
-        reward -= REWARD_DICT["standing_still"] # Moving still incurs a small time penalty to encourage efficiency
+        reward += REWARD_DICT["moving"]
     
     reward += REWARD_DICT["time_penalty"]
+
+    if curr_alive == 1 and prev_x == curr_x and prev_y == curr_y:
+        value_dist = _nearest_item_or_box_distance(prev_obs["map"], prev_x, prev_y)
+        if value_dist is not None and value_dist <= 2:
+            reward += REWARD_DICT["idle_near_value"]
 
     # 2b. DANGER EVASION — reward leaving predicted blast; penalize walking into it
     if _any_bombs(prev_obs) or _any_bombs(curr_obs):
@@ -455,8 +471,7 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Agent Moving Reward: {reward}")
-        # Moving avoids the standing still penalty, but still incurs the time penalty
-        expected = -REWARD_DICT["standing_still"] + REWARD_DICT["time_penalty"]
+        expected = REWARD_DICT["moving"] + REWARD_DICT["time_penalty"]
         assert reward == expected, f"Expected {expected} for just moving"
     
     def agent_plant_near_box(self):
@@ -477,6 +492,7 @@ class UnitTestReward:
         expected = (
             REWARD_DICT["standing_still"]
             + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["idle_near_value"]
             + REWARD_DICT["bomb_placed"]
             + REWARD_DICT["plant_near_box"]
             + REWARD_DICT["box_target"]
@@ -496,8 +512,13 @@ class UnitTestReward:
         }
         reward = compute_reward(prev_obs, curr_obs, agent_id=0)
         print(f"Item Collection Reward: {reward}")
-        expected = REWARD_DICT["standing_still"] + REWARD_DICT["time_penalty"] + REWARD_DICT["item_collection"]
-        assert reward == expected, "Expected positive reward for item collection"
+        expected = (
+            REWARD_DICT["standing_still"]
+            + REWARD_DICT["time_penalty"]
+            + REWARD_DICT["idle_near_value"]
+            + REWARD_DICT["item_collection"]
+        )
+        assert abs(reward - expected) < 1e-6, "Expected positive reward for item collection"
     
     def agent_place_bomb_no_box(self):
         # Renamed for clarity. Placing a bomb with NO boxes around should just be a normal turn.
@@ -538,7 +559,7 @@ class UnitTestReward:
         # Enemy at (0,0): Manhattan 5 -> 6 (one step away); approach term -1 * scale
         approach = REWARD_DICT["approach_enemy"] * (5 - 6)
         expected = (
-            -REWARD_DICT["standing_still"]
+            REWARD_DICT["moving"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["danger_evasion"]
             + approach
@@ -561,7 +582,7 @@ class UnitTestReward:
         print(f"Danger Evasion (urgent) Reward: {reward}")
         approach = REWARD_DICT["approach_enemy"] * (5 - 6)
         expected = (
-            -REWARD_DICT["standing_still"]
+            REWARD_DICT["moving"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["danger_evasion"] * 1.5
             + approach
@@ -583,7 +604,7 @@ class UnitTestReward:
         print(f"Approach Enemy Reward: {reward}")
         prev_d, curr_d = 4, 2
         expected = (
-            -REWARD_DICT["standing_still"]
+            REWARD_DICT["moving"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["approach_enemy"] * (prev_d - curr_d)
         )
@@ -605,7 +626,7 @@ class UnitTestReward:
         print(f"Danger Enter Reward: {reward}")
         approach = REWARD_DICT["approach_enemy"] * (6 - 5)
         expected = (
-            -REWARD_DICT["standing_still"]
+            REWARD_DICT["moving"]
             + REWARD_DICT["time_penalty"]
             + REWARD_DICT["danger_enter"]
             + approach

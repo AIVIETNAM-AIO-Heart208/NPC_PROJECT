@@ -185,11 +185,16 @@ class Agent:
         grid = context["grid"]
         enemies = context["enemies"]
         item_tiles = self._item_tiles(grid, context["bombs_left"], context["radius_bonus"])
+        item_dist = self._nearest_distance(context["my_pos"], item_tiles, default=26)
         bomb_score = self._bomb_score(grid, context["players"], context["my_pos"], context["bomb_radius"], enemies)
         late = self.turn >= 220 or len(enemies) <= 2
         if late and bomb_score >= self._bomb_threshold():
             return ["TRAP", "COLLECT_ITEM", "FARM_BOX", "HUNT", "SAFE_REPOSITION"]
-        if item_tiles and (context["bombs_left"] <= 1 or context["radius_bonus"] <= 1 or self.turn >= 180):
+        if item_tiles and (
+            context["bombs_left"] <= 1
+            or context["radius_bonus"] <= 1
+            or (self.turn >= 180 and item_dist <= 5)
+        ):
             return ["COLLECT_ITEM", "FARM_BOX", "TRAP", "HUNT", "SAFE_REPOSITION"]
         if self.turn < 220:
             return ["FARM_BOX", "COLLECT_ITEM", "TRAP", "HUNT", "SAFE_REPOSITION"]

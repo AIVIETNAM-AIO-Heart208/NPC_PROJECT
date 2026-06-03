@@ -695,7 +695,11 @@ def train_dqn(
     def make_enemy(agent_id, kind=None):
         kind = enemy_type if kind is None else kind
         if kind == "mixed":
-            kind = random.choice(["simple", "smarter", "tactical", "genius", "box_farmer"])
+            kind = random.choices(
+                ["simple", "smarter", "tactical", "genius", "box_farmer"],
+                weights=[1, 2, 4, 4, 2],
+                k=1,
+            )[0]
         if kind == "simple":
             return SimpleRuleAgent(agent_id)
         if kind == "smarter":
@@ -909,6 +913,72 @@ def training():
                     target_update_steps=args.target_update_steps,
                     save_every_episodes=args.save_every_episodes)
     
+
+def _dqn_escape_action(obs, agent_id):
+    grid = obs["map"]
+    players = obs["players"]
+    bombs = obs["bombs"]
+    x, y = int(players[agent_id][0]), int(players[agent_id][1])
+    danger = _danger_channel(grid, players, bombs)
+    valid = legal_actions(obs, agent_id)
+    best_action = None
+    best_score = -1e9
+    for action in valid:
+        if int(action) == 5:
+            continue
+        dx, dy = {
+            0: (0, 0),
+            1: (-1, 0),
+            2: (1, 0),
+            3: (0, -1),
+            4: (0, 1),
+        }.get(int(action), (0, 0))
+        nx, ny = x + dx, y + dy
+        if not (0 <= nx < grid.shape[0] and 0 <= ny < grid.shape[1]):
+            continue
+        open_neighbors = 0
+        for ddx, ddy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            tx, ty = nx + ddx, ny + ddy
+            if 0 <= tx < grid.shape[0] and 0 <= ty < grid.shape[1] and int(grid[tx, ty]) in (Map.GRASS, Map.ITEM_RADIUS, Map.ITEM_CAPACITY):
+                open_neighbors += 1
+        score = -float(danger[nx, ny]) * 10.0 + open_neighbors - (1.0 if int(action) == 0 else 0.0)
+        if score > best_score:
+            best_score = score
+            best_action = int(action)
+    return best_action if best_action is not None else 0
+
+
+def _dqn_safety_filtered_actions(obs, agent_id):
+    grid = obs["map"]
+    players = obs["players"]
+    bombs = obs["bombs"]
+    x, y = int(players[agent_id][0]), int(players[agent_id][1])
+    danger = _danger_channel(grid, players, bombs)
+    valid = legal_actions(obs, agent_id)
+    safe = []
+    for action in valid:
+        action = int(action)
+        if action == 5:
+            if _can_escape_after_placing(obs, agent_id):
+                safe.append(action)
+            continue
+        dx, dy = {
+            0: (0, 0),
+            1: (-1, 0),
+            2: (1, 0),
+            3: (0, -1),
+            4: (0, 1),
+        }.get(action, (0, 0))
+        nx, ny = x + dx, y + dy
+        if danger[nx, ny] <= 0.0:
+            safe.append(action)
+    if not safe:
+        return valid
+    if 0 in safe and len(safe) > 1 and danger[x, y] <= 0.0:
+        safe.remove(0)
+    return safe
+
+
 # Mandatory for submission
 class Agent:
     """DQN Agent for submission."""    
@@ -992,6 +1062,11 @@ class Agent:
             action: int in range [0, 5]
         """
         try:
+            danger = _danger_channel(obs["map"], obs["players"], obs["bombs"])
+            px, py = int(obs["players"][self.agent_id][0]), int(obs["players"][self.agent_id][1])
+            if danger[px, py] > 0.0:
+                return _dqn_escape_action(obs, self.agent_id)
+
             # Encode observation
             map_state, aux_state = encode_obs(
                 obs,
@@ -1006,7 +1081,7 @@ class Agent:
             # Get Q-values and select best action
             with torch.no_grad():
                 q_values = self.q_net(map_tensor, aux_tensor).squeeze(0)
-                valid = legal_actions(obs, self.agent_id)
+                valid = _dqn_safety_filtered_actions(obs, self.agent_id)
                 mask = torch.full_like(q_values, -1e9)
                 mask[torch.tensor(valid, dtype=torch.long, device=self.device)] = 0.0
                 action = (q_values + mask).argmax().item()
